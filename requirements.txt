@@ -1,0 +1,8 @@
+flask
+websockets
+requests
+requests-toolbelt
+beautifulsoup4
+Pillow
+groq
+gunicorn
