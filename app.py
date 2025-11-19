@@ -17,11 +17,9 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder
 from bs4 import BeautifulSoup
 from groq import Groq
 import textwrap
-import yt_dlp as youtube_dl
-from dataclasses import dataclass
 
 # ===============================================================
-# --- SETTINGS & CONSTANTS ---
+# --- CONFIGURATIONS ---
 # ===============================================================
 SOCKET_URL = "wss://chatp.net:5333/server"
 FILE_UPLOAD_URL = "https://cdn.talkinchat.com/post.php"
@@ -29,21 +27,29 @@ PROFILE_API_URL = "https://api.chatp.net/v2/user_profile"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 IMG_TXT_FONTS = 'fonts/Merienda-Regular.ttf'
 
-# Constants
+# --- CONSTANTS (Protocol Samjha Hua) ---
 HANDLER = "handler"
 TYPE = "type"
 MSG_BODY = "body"
 MSG_FROM = "from"
 ROOM = "room"
+NAME = "name"
+ID = "id"
+USERNAME = "username"
+PASSWORD = "password"
+
+# Server Protocol (Learned from tanvar.py)
+# Server sends chat messages inside 'room_event' with type 'text'
 HANDLER_LOGIN = "login"
+HANDLER_LOGIN_EVENT = "login_event"
 HANDLER_ROOM_JOIN = "room_join"
-HANDLER_ROOM_MESSAGE = "room_message"
-HANDLER_ROOM_EVENT = "room_event"
+HANDLER_ROOM_EVENT = "room_event"     # <--- Server sends chats here
+HANDLER_ROOM_MESSAGE = "room_message" # <--- We send chats here
 MSG_TYPE_TXT = "text"
 MSG_TYPE_IMG = "image"
-MSG_TYPE_AUDIO = "audio"
+EVENT_TYPE_SUCCESS = "success"
 
-COLOR_LIST = ["#F0F8FF","#FAEBD7","#0000FF","#8A2BE2","#A52A2A","#DEB887","#5F9EA0","#7FFF00","#D2691E","#FF7F50","#6495ED","#DC143C","#00FFFF","#00008B","#B8860B","#A9A9A9","#006400","#BDB76B","#8B008B","#556B2F","#FF8C00","#9932CC","#8B0000","#E9967A","#8FBC8F","#483D8B","#2F4F4F","#00CED1","#9400D3","#FF1493","#00BFFF","#696969","#1E90FF","#B22222","#228B22","#FF00FF","#DCDCDC","#FFD700","#DAA520","#808080","#008000","#ADFF2F","#FF69B4","#CD5C5C","#4B0082","#F0E68C","#E6E6FA","#7CFC00","#FFFACD","#ADD8E6","#F08080","#E0FFFF","#FAFAD2","#D3D3D3","#90EE90","#FFB6C1","#FFA07A","#20B2AA","#87CEFA","#778899","#B0C4DE","#FFFFE0","#00FF00","#32CD32","#FF00FF","#800000","#66CDAA","#0000CD","#BA55D3","#9370DB","#3CB371","#7B68EE","#00FA9A","#48D1CC","#C71585","#191970","#FFE4E1","#FFE4B5","#FFDEAD","#000080","#800000","#6B8E23","#FFA500","#FF4500","#DA70D6","#EEE8AA","#98FB98","#AFEEEE","#DB7093","#FFEFD5","#FFC0CB","#DDA0DD","#B0E0E6","#800080","#663399","#BC8F8F","#4169E1","#8B4513","#FA8072","#F4A460","#2E8B57","#A0522D","#C0C0C0","#87CEEB","#6A5ACD","#708090","#00FF7F","#4682B4","#D2B48C","#008080","#D8BFD8","#FF6347","#40E0D0","#EE82EE","#F5DEB3","#FFFFFF","#F5F5F5","#FFFF00","#9ACD32"]
+COLOR_LIST = ["#F0F8FF","#FAEBD7","#0000FF","#8A2BE2","#FFD700","#DC143C","#00FFFF"]
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SESSION_SECRET") or secrets.token_hex(32)
@@ -54,45 +60,21 @@ bot_config = {
     "is_running": False, "status": "Stopped", "masters": ["y"]
 }
 bot_state = {
-    "SESSION_TOKEN": None, "websocket": None, "loop": None,
-    "is_wc_on": False, "user_id_cache": {}, "groq_client": None,
-    "room_personalities": {}
+    "websocket": None, "loop": None,
+    "is_wc_on": False, "groq_client": None, "thread": None,
+    "room_personalities": {}, "user_id_cache": {}, "session_token": None
 }
 
-# ===============================================================
-# --- HELPER CLASSES ---
-# ===============================================================
-
-@dataclass
-class Song:
-    url: str = ""
-    duration: int = 0
-    thumb_url: str = ""
-    title: str = "Unknown Title"
-
-class HoroScope:
-    ZODIAC_SIGNS = {
-        "aries": 1, "taurus": 2, "gemini": 3, "cancer": 4, "leo": 5, "virgo": 6,
-        "libra": 7, "scorpio": 8, "sagittarius": 9, "capricorn": 10, "aquarius": 11, "pisces": 12
-    }
-    @staticmethod
-    def get_horoscope(zodiac_sign: str, day: str) -> str:
-        sign_number = HoroScope.ZODIAC_SIGNS.get(zodiac_sign.lower())
-        if not sign_number: return "Galat rashi."
-        url = f"https://www.horoscope.com/us/horoscopes/general/horoscope-general-daily-{day.lower()}.aspx?sign={sign_number}"
-        try:
-            soup = BeautifulSoup(requests.get(url).content, "html.parser")
-            return soup.find("div", class_="main-horoscope").p.text
-        except Exception as e: return f"Rashifal Error: {e}"
-
+# --- PERSONAS ---
 CORE_PROMPT = """
-[RULE: Reply shortly under 15 words.]
+[RULE: Reply shortly under 20 words.]
 [IDENTITY: You are '{bot_name}'. Not an AI, but a chat companion.]
 [LANGUAGE: Reply in user's language (English/Hindi/Arabic).]
 """
 PERSONAS = {
     "sweet": f"{CORE_PROMPT}\n[MOOD: SWEET]\nBe cute & use emojis ✨.",
     "tsundere": f"{CORE_PROMPT}\n[MOOD: TSUNDERE]\nAct annoyed but care 😒.",
+    "rude": f"{CORE_PROMPT}\n[MOOD: RUDE]\nBe sarcastic and mean.",
 }
 DEFAULT_PERSONA = "sweet"
 
@@ -116,7 +98,7 @@ def upload_image_php(file_path, room_name):
     try:
         data = MultipartEncoder(fields={
             'file': ('image.png', open(file_path, 'rb'), 'image/png'),
-            'jid': bot_config["username"], 'room': room_name, 'device_id': generate_random_id(16)
+            'jid': bot_config["username"], 'is_private': 'no', 'room': room_name, 'device_id': generate_random_id(16)
         })
         headers = {'Content-Type': data.content_type, 'User-Agent': 'okhttp/3.12.1'}
         return requests.post(FILE_UPLOAD_URL, data=data, headers=headers).text
@@ -133,14 +115,6 @@ def search_bing_images(query):
     except: pass
     return None
 
-def scrape_music_from_yt(searchQuery):
-    ydl_opts = {'format': 'm4a/bestaudio/best', 'noplaylist': True, 'quiet': True}
-    try:
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch:{searchQuery}", download=False)['entries'][0]
-            return Song(url=info['url'], duration=info.get('duration', 0), thumb_url=info['thumbnail'], title=info.get('title', 'Unknown'))
-    except: return None
-
 def draw_multiple_line_text(image, text, font, text_color, text_start_height):
     draw = ImageDraw.Draw(image)
     w, _ = image.size
@@ -153,145 +127,146 @@ def draw_multiple_line_text(image, text, font, text_color, text_start_height):
         y += lh + 5
 
 async def get_user_profile(user_id):
-    if not bot_state["SESSION_TOKEN"]: return None
+    if not bot_state["session_token"]: return None
     try:
-        headers = {'Authorization': f'Bearer {bot_state["SESSION_TOKEN"]}', 'User-Agent': 'IyadBot/1.0'}
+        headers = {'Authorization': f'Bearer {bot_state["session_token"]}', 'User-Agent': 'IyadBot/1.0'}
         res = requests.get(PROFILE_API_URL, headers=headers, params={'user_id': user_id})
         return res.json() if res.status_code == 200 else None
     except: return None
 
+class HoroScope:
+    ZODIAC_SIGNS = { "aries": 1, "taurus": 2, "gemini": 3, "cancer": 4, "leo": 5, "virgo": 6, "libra": 7, "scorpio": 8, "sagittarius": 9, "capricorn": 10, "aquarius": 11, "pisces": 12 }
+    @staticmethod
+    def get_horoscope(zodiac_sign: str, day: str) -> str:
+        sign_number = HoroScope.ZODIAC_SIGNS.get(zodiac_sign.lower())
+        if not sign_number: return "Invalid Sign."
+        url = f"https://www.horoscope.com/us/horoscopes/general/horoscope-general-daily-{day.lower()}.aspx?sign={sign_number}"
+        try:
+            soup = BeautifulSoup(requests.get(url).content, "html.parser")
+            return soup.find("div", class_="main-horoscope").p.text
+        except: return "Error fetching horoscope."
+
 # ===============================================================
-# --- CORE LOGIC ---
+# --- BOT LOGIC ---
 # ===============================================================
 
 async def send_packet(ws, data):
     await ws.send(json.dumps(data))
 
-async def send_message(ws, room, msg_type, body="", url="", length="0"):
-    packet = {
-        HANDLER: HANDLER_ROOM_MESSAGE, "id": generate_random_id(), ROOM: room,
-        TYPE: msg_type, "body": body, "msg_url": url, "length": str(length)
-    }
-    await send_packet(ws, packet)
+async def send_group_msg(ws, room, msg):
+    # Sending logic: We use 'room_message' (Standard)
+    jsonbody = {HANDLER: HANDLER_ROOM_MESSAGE, ID: generate_random_id(), ROOM: room, TYPE: MSG_TYPE_TXT, "url": "", MSG_BODY: msg, "length": "0"}
+    await ws.send(json.dumps(jsonbody))
+
+async def send_group_msg_image(ws, room, url):
+    jsonbody = {HANDLER: HANDLER_ROOM_MESSAGE, ID: generate_random_id(), ROOM: room, TYPE: MSG_TYPE_IMG, "url": url, MSG_BODY: "", "length": "0"}
+    await ws.send(json.dumps(jsonbody))
 
 async def get_ai_reply(ws, room, sender, prompt):
-    if not bot_state["groq_client"]: return await send_message(ws, room, MSG_TYPE_TXT, body="[!] AI Key Missing.")
+    if not bot_state["groq_client"]: return await send_group_msg(ws, room, "[!] AI Not Configured.")
     
-    p_temp = PERSONAS.get(bot_state["room_personalities"].get(room, DEFAULT_PERSONA), DEFAULT_PERSONA)
+    p_key = bot_state["room_personalities"].get(room, DEFAULT_PERSONA)
+    p_temp = PERSONAS.get(p_key, DEFAULT_PERSONA)
     final_persona = p_temp.format(bot_name=bot_config["username"])
-    
+
     try:
         completion = bot_state["groq_client"].chat.completions.create(
             messages=[{"role": "system", "content": final_persona}, {"role": "user", "content": prompt}],
             model="llama-3.1-8b-instant", max_tokens=100
         )
-        await send_message(ws, room, MSG_TYPE_TXT, body=f"@{sender} {completion.choices[0].message.content}")
+        await send_group_msg(ws, room, f"@{sender} {completion.choices[0].message.content}")
     except Exception as e: print(f"AI Error: {e}")
 
-async def handle_incoming_message(ws, data):
-    try:
-        sender = data.get(MSG_FROM)
-        message = data.get(MSG_BODY, "").strip()
-        room = data.get(ROOM)
+async def on_message(ws, data):
+    msg = data.get(MSG_BODY, "")
+    frm = data.get(MSG_FROM)
+    room = data.get(ROOM)
+    user_avi = data.get('avatar_url')
 
-        if sender == bot_config["username"] or not message: return
-        if 'user_id' in data: bot_state["user_id_cache"][sender.lower()] = data['user_id']
+    if frm == bot_config["username"]: return
+    if 'user_id' in data: bot_state["user_id_cache"][frm.lower()] = data['user_id']
 
-        # --- SINGLE TRIGGER LOGIC ---
-        # Ab sirf username hi trigger hai (Not "Iyad" etc.)
-        trigger_name = bot_config["username"].lower()
-        
-        if trigger_name in message.lower() and not message.startswith("!"):
-            prompt = message.lower().replace(trigger_name, "", 1).strip(" @,:")
-            # Original case prompt chahiye AI ke liye
-            original_prompt = re.sub(re.escape(bot_config["username"]), "", message, flags=re.IGNORECASE).strip(" @,:")
-            
-            if original_prompt: 
-                print(f"[TRIGGERED] by {sender}: {original_prompt}")
-                await get_ai_reply(ws, room, sender, original_prompt)
-            return
+    # --- 1. TRIGGER LOGIC (Only on Username) ---
+    trigger_name = bot_config["username"].lower()
+    if trigger_name in msg.lower() and not msg.startswith("!"):
+        prompt = msg.lower().replace(trigger_name, "", 1).strip(" @,:")
+        if prompt: 
+            print(f"[TRIGGER] {frm}: {prompt}")
+            await get_ai_reply(ws, room, frm, prompt)
+        return
 
-        # --- COMMANDS ---
-        if message.startswith("!"):
-            parts = message.split(' ', 1)
+    # --- 2. COMMANDS (Only ID.PY features) ---
+    if msg.startswith("!"):
+        try:
+            parts = msg.split(' ', 1)
             cmd = parts[0].lower()
             args = parts[1].strip() if len(parts) > 1 else ""
 
-            # 1. AI
-            if cmd == "!ai" and args: await get_ai_reply(ws, room, sender, args)
+            # AI Manual
+            if cmd == "!ai" and args: await get_ai_reply(ws, room, frm, args)
             
-            # 2. MUSIC
-            elif cmd == "!play" and args:
-                await send_message(ws, room, MSG_TYPE_TXT, body=f"🎶 Searching '{args}'...")
-                song = scrape_music_from_yt(args)
-                if song and song.url:
-                    if song.thumb_url: await send_message(ws, room, MSG_TYPE_IMG, url=song.thumb_url)
-                    await send_message(ws, room, MSG_TYPE_AUDIO, url=song.url, length=song.duration)
-                else: await send_message(ws, room, MSG_TYPE_TXT, body="Song nahi mila.")
+            # Persona Change
+            elif cmd == "!persona" and args:
+                if args.lower() in PERSONAS:
+                    bot_state["room_personalities"][room] = args.lower()
+                    await send_group_msg(ws, room, f"Mode set to: {args}")
+                else:
+                    await send_group_msg(ws, room, f"Available: {', '.join(PERSONAS.keys())}")
 
-            # 3. IMAGE
+            # Welcome Toggle (Master Only)
+            elif cmd == "!wc" and (frm in bot_config["masters"] or frm == bot_config["username"]):
+                bot_state["is_wc_on"] = not bot_state["is_wc_on"]
+                await send_group_msg(ws, room, f"Welcome Card: {bot_state['is_wc_on']}")
+
+            # Image
             elif cmd == "!img" and args:
-                await send_message(ws, room, MSG_TYPE_TXT, body=f"🖼️ Finding {args}...")
+                await send_group_msg(ws, room, "Searching image...")
                 link = search_bing_images(args)
-                if link: await send_message(ws, room, MSG_TYPE_IMG, url=link)
-                else: await send_message(ws, room, MSG_TYPE_TXT, body="Image not found.")
+                if link: await send_group_msg_image(ws, room, link)
+                else: await send_group_msg(ws, room, "No image found.")
 
-            # 4. HOROSCOPE
-            elif cmd == "!horo":
-                parts = args.split()
-                if len(parts) == 2:
-                    res = HoroScope.get_horoscope(parts[0], parts[1])
-                    await send_message(ws, room, MSG_TYPE_TXT, body=f"🔮 {parts[0]}:\n{res}")
-                else: await send_message(ws, room, MSG_TYPE_TXT, body="Use: !horo <rashi> <day>")
-
-            # 5. PROFILE
+            # Profile
             elif cmd == "!profile":
-                target = args.lstrip('@').lower() if args else sender.lower()
+                target = args.lstrip('@').lower() if args else frm.lower()
                 uid = bot_state["user_id_cache"].get(target)
                 if uid:
                     p = await get_user_profile(uid)
-                    if p: await send_message(ws, room, MSG_TYPE_TXT, body=f"👤 Name: {p.get('name')}\n🆔 ID: {uid}\n📍 Loc: {p.get('location')}")
-                else: await send_message(ws, room, MSG_TYPE_TXT, body="User info not cached yet.")
+                    if p: await send_group_msg(ws, room, f"👤 {p.get('name')} | 🆔 {uid}")
+                else: await send_group_msg(ws, room, "User not seen yet.")
+            
+            # Horoscope
+            elif cmd == "!horo" and args:
+                p = args.split()
+                if len(p) == 2: await send_group_msg(ws, room, HoroScope.get_horoscope(p[0], p[1]))
 
-            # 6. DRAW
-            elif cmd == "!draw" and 'avatar_url' in data:
-                try:
-                    try: font = ImageFont.truetype(IMG_TXT_FONTS, 60)
-                    except: font = ImageFont.load_default()
-                    resp = requests.get(data['avatar_url'])
-                    img = Image.open(BytesIO(resp.content)).resize((800,800)).filter(ImageFilter.GaussianBlur(15))
-                    draw_multiple_line_text(img, args, font, random.choice(COLOR_LIST), 300)
-                    img.save('draw.png')
-                    link = upload_image_php('draw.png', room)
-                    if link: await send_message(ws, room, MSG_TYPE_IMG, url=link)
-                except Exception as e: print(f"Draw Fail: {e}")
+            # Draw
+            elif cmd == "!draw" and user_avi:
+                font = ImageFont.truetype(IMG_TXT_FONTS, 60)
+                response = requests.get(user_avi)
+                avatar = Image.open(BytesIO(response.content)).resize((800,800)).filter(ImageFilter.GaussianBlur(15))
+                draw_multiple_line_text(avatar, args, font, random.choice(COLOR_LIST), 300)
+                avatar.save('pil_text.png')
+                link = upload_image_php('pil_text.png', room)
+                if link: await send_group_msg_image(ws, room, link)
 
-            # 7. MASTER COMMANDS
-            if sender in bot_config["masters"] or sender == bot_config["username"]:
-                if cmd == "!wc":
-                    bot_state["is_wc_on"] = not bot_state["is_wc_on"]
-                    await send_message(ws, room, MSG_TYPE_TXT, body=f"Welcome Card: {bot_state['is_wc_on']}")
-                elif cmd == "!persona" and args in PERSONAS:
-                    bot_state["room_personalities"][room] = args
-                    await send_message(ws, room, MSG_TYPE_TXT, body=f"Persona set to {args}")
-                elif cmd == "!join" and args:
-                    await send_packet(ws, {HANDLER: HANDLER_ROOM_JOIN, "id": generate_random_id(), "name": args})
+        except Exception as e: print(f"Cmd Error: {e}")
 
-    except Exception as e: print(f"Handler Error: {e}")
+async def on_wc_draw(ws, data):
+    if not bot_state["is_wc_on"]: return
+    try:
+        user = data.get(USERNAME)
+        room = data.get(NAME)
+        img = Image.new('RGB', (800, 600), color=random.choice(COLOR_LIST))
+        img.filter(ImageFilter.GaussianBlur(40))
+        font = ImageFont.truetype(IMG_TXT_FONTS, 60)
+        text1 = f"Welcome to {room}\n{user}"
+        draw_multiple_line_text(img, text1, font, random.choice(COLOR_LIST), 150)
+        img.save('pil_text.png')
+        link = upload_image_php('pil_text.png', room)
+        if link: await send_group_msg_image(ws, room, link)
+    except: pass
 
-async def on_user_joined(ws, data):
-    if bot_state["is_wc_on"]:
-        try:
-            u, r = data.get("username"), data.get("name")
-            img = Image.new('RGB', (800,600), random.choice(COLOR_LIST))
-            font = ImageFont.truetype(IMG_TXT_FONTS, 60)
-            draw_multiple_line_text(img, f"Welcome\n{u}", font, "#000000", 200)
-            img.save('wc.png')
-            link = upload_image_php('wc.png', r)
-            if link: await send_message(ws, r, MSG_TYPE_IMG, url=link)
-        except Exception as e: print(f"WC Error: {e}")
-
-# --- SOCKET ENGINE ---
+# --- MAIN SOCKET ENGINE ---
 async def bot_engine():
     if GROQ_API_KEY: bot_state["groq_client"] = Groq(api_key=GROQ_API_KEY)
     
@@ -303,18 +278,18 @@ async def bot_engine():
         try:
             print(f"[*] Connecting to {SOCKET_URL}...")
             async with websockets.connect(SOCKET_URL, ssl=ssl_ctx) as ws:
-                bot_state["websocket"] = ws
-                bot_config["status"] = "Connected"
                 print("[+] Connected!")
 
+                # LOGIN
                 await send_packet(ws, {
-                    HANDLER: HANDLER_LOGIN, "id": generate_random_id(),
-                    "username": bot_config["username"], "password": bot_config["password"]
+                    HANDLER: HANDLER_LOGIN, ID: generate_random_id(),
+                    USERNAME: bot_config["username"], PASSWORD: bot_config["password"]
                 })
 
+                # PING LOOP
                 async def pinger():
                     while bot_config["is_running"]:
-                        await asyncio.sleep(25)
+                        await asyncio.sleep(15)
                         try: await send_packet(ws, {"handler": "ping", "id": generate_random_id()})
                         except: break
                 asyncio.create_task(pinger())
@@ -323,29 +298,32 @@ async def bot_engine():
                     if not bot_config["is_running"]: break
                     try:
                         data = json.loads(raw_msg)
-                        h = data.get(HANDLER)
-                        t = data.get(TYPE)
+                        handler = data.get(HANDLER)
+                        evt_type = data.get(TYPE)
 
-                        if h == "login_event" and t == "success":
-                            bot_state["SESSION_TOKEN"] = data.get('s')
-                            print("[+] Login OK. Joining Room...")
-                            await send_packet(ws, {HANDLER: HANDLER_ROOM_JOIN, "id": generate_random_id(), "name": bot_config["room"]})
+                        # Login Success
+                        if handler == HANDLER_LOGIN_EVENT and evt_type == EVENT_TYPE_SUCCESS:
+                            bot_state["session_token"] = data.get('s')
+                            print("[+] Logged In. Joining Room...")
+                            await send_packet(ws, {HANDLER: HANDLER_ROOM_JOIN, ID: generate_random_id(), NAME: bot_config["room"]})
 
-                        elif t == "you_joined":
-                            print(f"[+] Joined Room: {data.get('name')}")
-                            await send_message(ws, data.get('name'), MSG_TYPE_TXT, body="Online! 🚀")
+                        # === PROTOCOL FIX ===
+                        # Server sends chat messages as 'room_event' with type 'text' (Learned from tanvar.py)
+                        elif handler == HANDLER_ROOM_EVENT and evt_type == MSG_TYPE_TXT:
+                            await on_message(ws, data)
+                        
+                        # Fallback for standard message just in case
+                        elif handler == HANDLER_ROOM_MESSAGE and evt_type == MSG_TYPE_TXT:
+                            await on_message(ws, data)
 
-                        elif h == HANDLER_ROOM_MESSAGE and t == MSG_TYPE_TXT:
-                            await handle_incoming_message(ws, data)
-
-                        elif h == HANDLER_ROOM_EVENT and t == "user_joined":
-                            await on_user_joined(ws, data)
+                        # User Joined (Welcome)
+                        elif handler == HANDLER_ROOM_EVENT and evt_type == "user_joined":
+                            await on_wc_draw(ws, data)
 
                     except Exception as e: print(f"Parse Error: {e}")
 
         except Exception as e:
             print(f"Connection Error: {e}")
-            bot_config["status"] = "Error"
             await asyncio.sleep(5)
 
 # --- FLASK ---
@@ -357,18 +335,21 @@ def start_background_thread():
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    if 'logged_in' in session and bot_config['is_running']: return redirect('/dashboard')
+    if bot_config["is_running"]: return redirect('/dashboard')
     if request.method == "POST":
         bot_config["username"] = request.form.get("username")
         bot_config["password"] = request.form.get("password")
         bot_config["room"] = request.form.get("room")
         bot_config["is_running"] = True
-        if "y" not in bot_config["masters"]: bot_config["masters"].append("y")
-        bot_config["masters"].append(bot_config["username"])
         
-        t = threading.Thread(target=start_background_thread)
-        t.daemon = True
-        t.start()
+        if bot_config["username"] not in bot_config["masters"]:
+            bot_config["masters"].append(bot_config["username"])
+
+        if bot_state["thread"] is None or not bot_state["thread"].is_alive():
+            t = threading.Thread(target=start_background_thread)
+            t.daemon = True
+            t.start()
+            bot_state["thread"] = t
         
         session['logged_in'] = True
         return redirect("/dashboard")
@@ -383,10 +364,19 @@ def stop():
     bot_config["is_running"] = False
     return redirect("/dashboard")
 
-# --- TEMPLATES ---
+# Self Wake (Keep Alive)
+def self_wake():
+    while True:
+        time.sleep(300)
+        try: 
+            if bot_config["is_running"]: requests.get("http://127.0.0.1:5000/")
+        except: pass
+threading.Thread(target=self_wake, daemon=True).start()
+
+# Templates
 LOGIN_HTML = """
 <!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;margin-top:50px'>
-<h2>🤖 Web Bot Login</h2>
+<h2>🤖 Enhanced ID Bot</h2>
 <form method='POST' style='max-width:300px;margin:auto'>
 <input name='username' placeholder='Username' required style='width:100%;padding:10px;margin:5px'><br>
 <input name='password' placeholder='Password' type='password' required style='width:100%;padding:10px;margin:5px'><br>
@@ -404,7 +394,7 @@ DASHBOARD_HTML = """
 <h3>Trigger:</h3>
 <p>Only <b>{{ username }}</b></p>
 <h3>Commands:</h3>
-<p>!play [song], !ai [msg], !img [query], !horo [sign] [day], !draw [text], !profile, !wc</p>
+<p>!ai, !persona [mode], !img, !horo, !draw, !profile, !wc</p>
 </body></html>
 """
 
