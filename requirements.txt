@@ -1,8 +1,9 @@
 flask
 websockets
 requests
-aiohttp
+aiohttp==3.9.5
 pillow
 beautifulsoup4
 groq
 gunicorn
+typing_extensions
