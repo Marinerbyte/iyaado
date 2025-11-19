@@ -1,5 +1,5 @@
 flask
-websockets==10.4
+websockets
 requests
 requests-toolbelt
 beautifulsoup4
