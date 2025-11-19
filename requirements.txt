@@ -1,8 +1,9 @@
 flask
-websockets
+websockets==10.4
 requests
 requests-toolbelt
 beautifulsoup4
 Pillow
 groq
 gunicorn
+asyncio
