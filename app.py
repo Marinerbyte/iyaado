@@ -7,12 +7,11 @@ import requests
 import os
 import secrets
 import ssl
-import re
 import time
 import aiohttp
 from urllib.parse import quote_plus
 from io import BytesIO
-from flask import Flask, render_template_string, request, redirect, url_for, session
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from bs4 import BeautifulSoup
 from groq import AsyncGroq
@@ -26,6 +25,7 @@ FILE_UPLOAD_URL = "https://cdn.talkinchat.com/post.php"
 PROFILE_API_URL = "https://api.chatp.net/v2/user_profile"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 IMG_TXT_FONTS = 'fonts/Merienda-Regular.ttf'
+PORT = int(os.environ.get('PORT', 5000))
 
 # --- CONSTANTS ---
 HANDLER = "handler"
@@ -37,30 +37,16 @@ NAME = "name"
 ID = "id"
 USERNAME = "username"
 PASSWORD = "password"
-
-HANDLER_LOGIN = "login"
-HANDLER_LOGIN_EVENT = "login_event"
-HANDLER_ROOM_JOIN = "room_join"
-HANDLER_ROOM_EVENT = "room_event"
-HANDLER_ROOM_MESSAGE = "room_message"
 MSG_TYPE_TXT = "text"
 MSG_TYPE_IMG = "image"
-EVENT_TYPE_SUCCESS = "success"
-
 COLOR_LIST = ["#F0F8FF","#FAEBD7","#0000FF","#8A2BE2","#FFD700","#DC143C","#00FFFF"]
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SESSION_SECRET") or secrets.token_hex(32)
 
-# --- GLOBAL STATE ---
-bot_config = {
-    "username": "", "password": "", "room": "",
-    "is_running": False, "status": "Stopped", "masters": ["y"]
-}
-bot_state = {
-    "loop": None, "groq_client": None, "thread": None,
-    "room_personalities": {}, "user_id_cache": {}, "session_token": None
-}
+# --- GLOBAL STORE FOR ACTIVE BOTS ---
+# Format: { "username_lower": BotInstanceObject }
+ACTIVE_BOTS = {}
 
 # --- PERSONAS ---
 CORE_PROMPT = """
@@ -78,7 +64,6 @@ DEFAULT_PERSONA = "sweet"
 # ===============================================================
 # --- HELPER FUNCTIONS ---
 # ===============================================================
-
 def generate_random_id(length=20):
     return ''.join(random.choice("0123456789abcdefghijklmnopqrstuvwxyz") for _ in range(length))
 
@@ -92,7 +77,7 @@ def check_and_download_font():
         except: pass
 check_and_download_font()
 
-# --- ASYNC HELPERS (Speed ke liye) ---
+# --- ASYNC HELPERS ---
 async def async_upload_image(file_bytes, room_name, username):
     try:
         form = aiohttp.FormData()
@@ -101,13 +86,10 @@ async def async_upload_image(file_bytes, room_name, username):
         form.add_field('is_private', 'no')
         form.add_field('room', room_name)
         form.add_field('device_id', generate_random_id(16))
-        
         async with aiohttp.ClientSession() as session:
             async with session.post(FILE_UPLOAD_URL, data=form) as resp:
                 return await resp.text()
-    except Exception as e:
-        print(f"Upload Error: {e}")
-        return None
+    except: return None
 
 async def async_search_bing(query):
     try:
@@ -116,7 +98,6 @@ async def async_search_bing(query):
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as resp:
                 html = await resp.text()
-        
         soup = BeautifulSoup(html, 'html.parser')
         for item in soup.find_all("a", class_="iusc"):
             if 'm' in item.attrs:
@@ -125,18 +106,7 @@ async def async_search_bing(query):
     except: pass
     return None
 
-async def get_user_profile(user_id):
-    if not bot_state["session_token"]: return None
-    try:
-        headers = {'Authorization': f'Bearer {bot_state["session_token"]}', 'User-Agent': 'IyadBot/1.0'}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(PROFILE_API_URL, headers=headers, params={'user_id': user_id}) as resp:
-                return await resp.json() if resp.status == 200 else None
-    except: return None
-
-# --- BLOCKING TASKS (Running in Thread) ---
-
-# 1. Image Drawing
+# --- PROCESSORS (Thread Safe) ---
 def process_draw_image(avatar_bytes, text):
     try:
         font = ImageFont.truetype(IMG_TXT_FONTS, 60)
@@ -155,7 +125,6 @@ def process_draw_image(avatar_bytes, text):
         return out.getvalue()
     except: return None
 
-# 2. Welcome Image
 def process_wc_image(user, room):
     try:
         img = Image.new('RGB', (800, 600), color=random.choice(COLOR_LIST))
@@ -175,253 +144,288 @@ def process_wc_image(user, room):
         return out.getvalue()
     except: return None
 
-# 3. Horoscope Logic (Restored)
 def process_horoscope(sign, day):
     zodiac_signs = { "aries": 1, "taurus": 2, "gemini": 3, "cancer": 4, "leo": 5, "virgo": 6, "libra": 7, "scorpio": 8, "sagittarius": 9, "capricorn": 10, "aquarius": 11, "pisces": 12 }
     sign_number = zodiac_signs.get(sign.lower())
     if not sign_number: return "Invalid Sign."
     try:
         url = f"https://www.horoscope.com/us/horoscopes/general/horoscope-general-daily-{day.lower()}.aspx?sign={sign_number}"
-        # Requests is safe here because we call it inside 'run_in_executor'
         soup = BeautifulSoup(requests.get(url).content, "html.parser")
         return soup.find("div", class_="main-horoscope").p.text
     except: return "Error fetching horoscope."
 
 # ===============================================================
-# --- BOT LOGIC ---
+# --- THE BOT CLASS (MULTI USER LOGIC) ---
 # ===============================================================
 
-async def send_packet(ws, data):
-    await ws.send(json.dumps(data))
+class TalkinChatBot:
+    def __init__(self, username, password, room):
+        self.username = username
+        self.password = password
+        self.room = room
+        self.is_running = True
+        self.status = "Running"
+        self.masters = [username.lower(), "y"]
+        
+        # State
+        self.loop = None
+        self.groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+        self.room_personalities = {}
+        self.user_id_cache = {}
+        self.session_token = None
+        self.is_wc_on = False
 
-async def send_group_msg(ws, room, msg):
-    jsonbody = {HANDLER: HANDLER_ROOM_MESSAGE, ID: generate_random_id(), ROOM: room, TYPE: MSG_TYPE_TXT, "url": "", MSG_BODY: msg, "length": "0"}
-    await ws.send(json.dumps(jsonbody))
-
-async def send_group_msg_image(ws, room, url):
-    jsonbody = {HANDLER: HANDLER_ROOM_MESSAGE, ID: generate_random_id(), ROOM: room, TYPE: MSG_TYPE_IMG, "url": url, MSG_BODY: "", "length": "0"}
-    await ws.send(json.dumps(jsonbody))
-
-async def get_ai_reply(ws, room, sender, prompt):
-    if not bot_state["groq_client"]: return await send_group_msg(ws, room, "[!] AI Not Configured.")
-    p_key = bot_state["room_personalities"].get(room, DEFAULT_PERSONA)
-    p_temp = PERSONAS.get(p_key, DEFAULT_PERSONA)
-    final_persona = p_temp.format(bot_name=bot_config["username"])
-    try:
-        completion = await bot_state["groq_client"].chat.completions.create(
-            messages=[{"role": "system", "content": final_persona}, {"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant", max_tokens=100
-        )
-        # FIX: Using #sender
-        await send_group_msg(ws, room, f"#{sender} {completion.choices[0].message.content}")
-    except Exception as e: print(f"AI Error: {e}")
-
-async def on_message(ws, data):
-    msg = data.get(MSG_BODY, "")
-    frm = data.get(MSG_FROM)
-    room = data.get(ROOM)
-    user_avi = data.get('avatar_url')
-
-    if frm == bot_config["username"]: return
-    if 'user_id' in data: bot_state["user_id_cache"][frm.lower()] = data['user_id']
-
-    trigger_name = bot_config["username"].lower()
-    
-    # AI TRIGGER
-    if trigger_name in msg.lower() and not msg.startswith("!"):
-        prompt = msg.lower().replace(trigger_name, "", 1).strip(" @,:")
-        if prompt: 
-            print(f"[TRIGGER] {frm}: {prompt}")
-            asyncio.create_task(get_ai_reply(ws, room, frm, prompt))
-        return
-
-    # COMMANDS
-    if msg.startswith("!"):
-        loop = asyncio.get_running_loop()
+    async def get_user_profile(self, user_id):
+        if not self.session_token: return None
         try:
-            parts = msg.split(' ', 1)
-            cmd = parts[0].lower()
-            args = parts[1].strip() if len(parts) > 1 else ""
+            headers = {'Authorization': f'Bearer {self.session_token}', 'User-Agent': 'IyadBot/1.0'}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(PROFILE_API_URL, headers=headers, params={'user_id': user_id}) as resp:
+                    return await resp.json() if resp.status == 200 else None
+        except: return None
 
-            if cmd == "!ai" and args: 
-                asyncio.create_task(get_ai_reply(ws, room, frm, args))
-            
-            elif cmd == "!persona" and args:
-                if args.lower() in PERSONAS:
-                    bot_state["room_personalities"][room] = args.lower()
-                    await send_group_msg(ws, room, f"#{frm} Mode set to: {args}")
+    async def send_packet(self, ws, data):
+        try: await ws.send(json.dumps(data))
+        except: pass
 
-            elif cmd == "!wc" and (frm in bot_config["masters"] or frm == bot_config["username"]):
-                bot_state["is_wc_on"] = not bot_state["is_wc_on"]
-                await send_group_msg(ws, room, f"#{frm} Welcome Card: {bot_state['is_wc_on']}")
+    async def send_msg(self, ws, room, msg, type=MSG_TYPE_TXT, url=""):
+        body = {HANDLER: "room_message", ID: generate_random_id(), ROOM: room, TYPE: type, "url": url, MSG_BODY: msg, "length": "0"}
+        await self.send_packet(ws, body)
 
-            elif cmd == "!img" and args:
-                await send_group_msg(ws, room, f"#{frm} 🔎 Searching...")
-                link = await async_search_bing(args)
-                if link: await send_group_msg_image(ws, room, link)
-                else: await send_group_msg(ws, room, "No image found.")
-
-            elif cmd == "!profile":
-                target = args.lstrip('@').lower() if args else frm.lower()
-                uid = bot_state["user_id_cache"].get(target)
-                if uid:
-                    p = await get_user_profile(uid)
-                    if p: await send_group_msg(ws, room, f"👤 {p.get('name')} | 🆔 {uid}")
-                else: await send_group_msg(ws, room, "User not seen yet.")
-
-            # HOROSCOPE IS BACK
-            elif cmd == "!horo" and args:
-                p = args.split()
-                day = p[1] if len(p) > 1 else "today"
-                sign = p[0]
-                # Run in background so bot doesn't freeze
-                result = await loop.run_in_executor(None, process_horoscope, sign, day)
-                await send_group_msg(ws, room, f"#{frm} {result}")
-
-            elif cmd == "!draw" and user_avi:
-                if not args: return
-                await send_group_msg(ws, room, "🎨 Drawing...")
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(user_avi) as resp:
-                        avi_bytes = await resp.read()
-                
-                img_bytes = await loop.run_in_executor(None, process_draw_image, avi_bytes, args)
-                
-                if img_bytes:
-                    link = await async_upload_image(img_bytes, room, bot_config["username"])
-                    if link: await send_group_msg_image(ws, room, link)
-
-        except Exception as e: print(f"Cmd Error: {e}")
-
-async def on_wc_draw(ws, data):
-    if not bot_state["is_wc_on"]: return
-    try:
-        loop = asyncio.get_running_loop()
-        user = data.get(USERNAME)
-        room = data.get(NAME)
-        img_bytes = await loop.run_in_executor(None, process_wc_image, user, room)
-        if img_bytes:
-            link = await async_upload_image(img_bytes, room, bot_config["username"])
-            if link: await send_group_msg_image(ws, room, link)
-    except: pass
-
-# --- MAIN SOCKET ENGINE ---
-async def bot_engine():
-    if GROQ_API_KEY: bot_state["groq_client"] = AsyncGroq(api_key=GROQ_API_KEY)
-    
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-
-    while bot_config["is_running"]:
+    async def get_ai_reply(self, ws, room, sender, prompt):
+        if not self.groq_client: return await self.send_msg(ws, room, "[!] AI Not Configured.")
+        p_key = self.room_personalities.get(room, DEFAULT_PERSONA)
+        final_persona = PERSONAS.get(p_key, DEFAULT_PERSONA).format(bot_name=self.username)
         try:
-            print(f"[*] Connecting to {SOCKET_URL}...")
-            async with websockets.connect(SOCKET_URL, ssl=ssl_ctx) as ws:
-                print("[+] Connected!")
+            completion = await self.groq_client.chat.completions.create(
+                messages=[{"role": "system", "content": final_persona}, {"role": "user", "content": prompt}],
+                model="llama-3.1-8b-instant", max_tokens=100
+            )
+            await self.send_msg(ws, room, f"#{sender} {completion.choices[0].message.content}")
+        except Exception as e: print(f"AI Error: {e}")
 
-                await send_packet(ws, {
-                    HANDLER: HANDLER_LOGIN, ID: generate_random_id(),
-                    USERNAME: bot_config["username"], PASSWORD: bot_config["password"]
-                })
+    async def engine(self):
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        
+        while self.is_running:
+            try:
+                print(f"[*] {self.username} connecting...")
+                async with websockets.connect(SOCKET_URL, ssl=ssl_ctx) as ws:
+                    # Login
+                    await self.send_packet(ws, {HANDLER: "login", ID: generate_random_id(), USERNAME: self.username, PASSWORD: self.password})
+                    
+                    # Pinger
+                    async def pinger():
+                        while self.is_running:
+                            await asyncio.sleep(15)
+                            try: await self.send_packet(ws, {"handler": "ping", "id": generate_random_id()})
+                            except: break
+                    asyncio.create_task(pinger())
 
-                async def pinger():
-                    while bot_config["is_running"]:
-                        await asyncio.sleep(15)
-                        try: await send_packet(ws, {"handler": "ping", "id": generate_random_id()})
-                        except: break
-                asyncio.create_task(pinger())
+                    async for raw in ws:
+                        if not self.is_running: break
+                        try:
+                            data = json.loads(raw)
+                            h = data.get(HANDLER)
+                            t = data.get(TYPE)
+                            
+                            if h == "login_event" and t == "success":
+                                self.session_token = data.get('s')
+                                print(f"[+] {self.username} Logged In. Joining {self.room}...")
+                                await self.send_packet(ws, {HANDLER: "room_join", ID: generate_random_id(), NAME: self.room})
 
-                async for raw_msg in ws:
-                    if not bot_config["is_running"]: break
-                    try:
-                        data = json.loads(raw_msg)
-                        handler = data.get(HANDLER)
-                        evt_type = data.get(TYPE)
+                            elif h == "room_event" and t == "user_joined":
+                                if self.is_wc_on:
+                                    loop = asyncio.get_running_loop()
+                                    img = await loop.run_in_executor(None, process_wc_image, data.get(USERNAME), data.get(NAME))
+                                    if img:
+                                        lnk = await async_upload_image(img, data.get(NAME), self.username)
+                                        if lnk: await self.send_msg(ws, data.get(NAME), "", MSG_TYPE_IMG, lnk)
 
-                        if handler == HANDLER_LOGIN_EVENT and evt_type == EVENT_TYPE_SUCCESS:
-                            bot_state["session_token"] = data.get('s')
-                            print("[+] Logged In. Joining Room...")
-                            await send_packet(ws, {HANDLER: HANDLER_ROOM_JOIN, ID: generate_random_id(), NAME: bot_config["room"]})
+                            elif (h == "room_event" or h == "room_message") and t == MSG_TYPE_TXT:
+                                await self.handle_message(ws, data)
+                        except: pass
+            except Exception as e:
+                print(f"Err {self.username}: {e}")
+                await asyncio.sleep(5)
+        print(f"[-] {self.username} Stopped.")
 
-                        elif handler == HANDLER_ROOM_EVENT and evt_type == MSG_TYPE_TXT:
-                            asyncio.create_task(on_message(ws, data))
-                        
-                        elif handler == HANDLER_ROOM_MESSAGE and evt_type == MSG_TYPE_TXT:
-                            asyncio.create_task(on_message(ws, data))
+    async def handle_message(self, ws, data):
+        msg = data.get(MSG_BODY, "")
+        frm = data.get(MSG_FROM)
+        room = data.get(ROOM)
+        user_avi = data.get('avatar_url')
+        if frm == self.username: return
+        if 'user_id' in data: self.user_id_cache[frm.lower()] = data['user_id']
 
-                        elif handler == HANDLER_ROOM_EVENT and evt_type == "user_joined":
-                            asyncio.create_task(on_wc_draw(ws, data))
+        # AI Trigger
+        trigger = self.username.lower()
+        if trigger in msg.lower() and not msg.startswith("!"):
+            prompt = msg.lower().replace(trigger, "", 1).strip(" @,:")
+            if prompt: asyncio.create_task(self.get_ai_reply(ws, room, frm, prompt))
+            return
 
-                    except Exception as e: print(f"Parse Error: {e}")
+        # Commands
+        if msg.startswith("!"):
+            loop = asyncio.get_running_loop()
+            try:
+                parts = msg.split(' ', 1)
+                cmd = parts[0].lower()
+                args = parts[1].strip() if len(parts) > 1 else ""
 
-        except Exception as e:
-            print(f"Connection Error: {e}")
-            await asyncio.sleep(5)
+                if cmd == "!ai" and args: asyncio.create_task(self.get_ai_reply(ws, room, frm, args))
+                elif cmd == "!persona" and args:
+                    if args.lower() in PERSONAS:
+                        self.room_personalities[room] = args.lower()
+                        await self.send_msg(ws, room, f"#{frm} Mode: {args}")
+                elif cmd == "!wc" and (frm in self.masters):
+                    self.is_wc_on = not self.is_wc_on
+                    await self.send_msg(ws, room, f"#{frm} WC: {self.is_wc_on}")
+                elif cmd == "!img" and args:
+                    await self.send_msg(ws, room, "🔎")
+                    lnk = await async_search_bing(args)
+                    if lnk: await self.send_msg(ws, room, "", MSG_TYPE_IMG, lnk)
+                    else: await self.send_msg(ws, room, "Not found")
+                elif cmd == "!profile":
+                    target = args.lstrip('@').lower() if args else frm.lower()
+                    uid = self.user_id_cache.get(target)
+                    if uid:
+                        p = await self.get_user_profile(uid)
+                        if p: await self.send_msg(ws, room, f"👤 {p.get('name')} | 🆔 {uid}")
+                    else: await self.send_msg(ws, room, "User hidden/unknown")
+                elif cmd == "!horo" and args:
+                    p = args.split()
+                    day = p[1] if len(p) > 1 else "today"
+                    res = await loop.run_in_executor(None, process_horoscope, p[0], day)
+                    await self.send_msg(ws, room, f"#{frm} {res}")
+                elif cmd == "!draw" and user_avi and args:
+                    await self.send_msg(ws, room, "🎨")
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(user_avi) as resp:
+                            avi_bytes = await resp.read()
+                    img = await loop.run_in_executor(None, process_draw_image, avi_bytes, args)
+                    if img:
+                        lnk = await async_upload_image(img, room, self.username)
+                        if lnk: await self.send_msg(ws, room, "", MSG_TYPE_IMG, lnk)
+            except: pass
 
-# --- FLASK ---
-def start_background_thread():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    bot_state["loop"] = loop
-    loop.run_until_complete(bot_engine())
+    def run_thread(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.loop = loop
+        loop.run_until_complete(self.engine())
+
+# ===============================================================
+# --- FLASK ROUTES ---
+# ===============================================================
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    if bot_config["is_running"]: return redirect('/dashboard')
-    if request.method == "POST":
-        bot_config["username"] = request.form.get("username")
-        bot_config["password"] = request.form.get("password")
-        bot_config["room"] = request.form.get("room")
-        bot_config["is_running"] = True
+    if 'username' in session:
+        return redirect('/dashboard')
         
-        if bot_config["username"] not in bot_config["masters"]:
-            bot_config["masters"].append(bot_config["username"])
-
-        if bot_state["thread"] is None or not bot_state["thread"].is_alive():
-            t = threading.Thread(target=start_background_thread)
+    if request.method == "POST":
+        user = request.form.get("username")
+        pwd = request.form.get("password")
+        room = request.form.get("room")
+        
+        # Create Bot Instance
+        user_key = user.lower()
+        if user_key in ACTIVE_BOTS:
+            flash("Bot already running! Logged in.")
+        else:
+            new_bot = TalkinChatBot(user, pwd, room)
+            t = threading.Thread(target=new_bot.run_thread)
             t.daemon = True
             t.start()
-            bot_state["thread"] = t
-        
+            ACTIVE_BOTS[user_key] = new_bot
+            
+        session['username'] = user_key
         return redirect("/dashboard")
     return render_template_string(LOGIN_HTML)
 
 @app.route("/dashboard")
 def dashboard():
-    return render_template_string(DASHBOARD_HTML, **bot_config)
+    user_key = session.get('username')
+    if not user_key or user_key not in ACTIVE_BOTS:
+        session.pop('username', None)
+        return redirect("/")
+    
+    bot = ACTIVE_BOTS[user_key]
+    return render_template_string(DASHBOARD_HTML, 
+                                  username=bot.username, 
+                                  room=bot.room, 
+                                  status="Running" if bot.is_running else "Stopped",
+                                  wc_status="ON" if bot.is_wc_on else "OFF")
 
 @app.route("/stop", methods=["POST"])
 def stop():
-    bot_config["is_running"] = False
-    return redirect("/dashboard")
+    user_key = session.get('username')
+    if user_key and user_key in ACTIVE_BOTS:
+        bot = ACTIVE_BOTS[user_key]
+        bot.is_running = False
+        del ACTIVE_BOTS[user_key]
+        session.pop('username', None)
+    return redirect("/")
 
+@app.route("/logout")
+def logout():
+    session.pop('username', None)
+    return redirect("/")
+
+# Self Wake (Keeps Render Alive)
 def self_wake():
     while True:
         time.sleep(300)
-        try: 
-            if bot_config["is_running"]: requests.get("http://127.0.0.1:5000/")
+        try: requests.get(f"http://127.0.0.1:{PORT}/")
         except: pass
 threading.Thread(target=self_wake, daemon=True).start()
 
-# Templates
+# HTML TEMPLATES
 LOGIN_HTML = """
-<!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;margin-top:50px'>
-<h2>🤖 Fast ID Bot</h2>
-<form method='POST' style='max-width:300px;margin:auto'>
-<input name='username' placeholder='Username' required style='width:100%;padding:10px;margin:5px'><br>
-<input name='password' placeholder='Password' type='password' required style='width:100%;padding:10px;margin:5px'><br>
-<input name='room' placeholder='Room Name' required style='width:100%;padding:10px;margin:5px'><br>
-<button style='width:100%;padding:10px;background:blue;color:white;border:none'>START BOT</button>
-</form></body></html>
+<!DOCTYPE html>
+<html>
+<head><title>MultiBot Panel</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style='font-family:sans-serif;text-align:center;background:#f0f2f5;padding-top:50px'>
+<div style='background:white;max-width:350px;margin:auto;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)'>
+<h2>🤖 Bot Manager</h2>
+{% with messages = get_flashed_messages() %}
+  {% if messages %}<p style="color:red">{{ messages[0] }}</p>{% endif %}
+{% endwith %}
+<form method='POST'>
+<input name='username' placeholder='Bot Username' required style='width:90%;padding:12px;margin:8px;border:1px solid #ddd;border-radius:5px'><br>
+<input name='password' placeholder='Password' type='password' required style='width:90%;padding:12px;margin:8px;border:1px solid #ddd;border-radius:5px'><br>
+<input name='room' placeholder='Room Name' required style='width:90%;padding:12px;margin:8px;border:1px solid #ddd;border-radius:5px'><br>
+<button style='width:100%;padding:12px;background:#0084ff;color:white;border:none;border-radius:5px;font-weight:bold;cursor:pointer'>LAUNCH BOT 🚀</button>
+</form>
+</div>
+</body></html>
 """
 
 DASHBOARD_HTML = """
-<!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;margin-top:50px'>
-<h1>Status: {{ status }}</h1>
-<p>Bot: <b>{{ username }}</b> | Room: <b>{{ room }}</b></p>
-<form action='/stop' method='POST'><button style='background:red;color:white;padding:10px'>STOP BOT</button></form>
+<!DOCTYPE html>
+<html>
+<head><title>Dashboard</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style='font-family:sans-serif;text-align:center;background:#f0f2f5;padding-top:50px'>
+<div style='background:white;max-width:350px;margin:auto;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)'>
+<h1>👋 Hi, {{ username }}</h1>
+<div style='text-align:left;background:#eee;padding:15px;border-radius:5px;margin-bottom:20px'>
+<p><b>Status:</b> {{ status }} 🟢</p>
+<p><b>Room:</b> {{ room }}</p>
+<p><b>Welcome Card:</b> {{ wc_status }}</p>
+</div>
+<h3>Commands:</h3>
+<p style='font-size:12px;color:#555'>!ai [msg], !img [query], !draw [text], !horo [sign], !wc, !profile</p>
+<hr>
+<form action='/stop' method='POST'>
+<button style='width:100%;padding:12px;background:#ff4d4d;color:white;border:none;border-radius:5px;cursor:pointer;margin-bottom:10px'>🛑 STOP BOT</button>
+</form>
+<a href='/logout' style='color:blue;text-decoration:none'>Log out (Keep Bot Running)</a>
+</div>
 </body></html>
 """
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    app.run(host='0.0.0.0', port=PORT)
